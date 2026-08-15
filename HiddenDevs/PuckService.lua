@@ -1,59 +1,22 @@
 -- Discord: goofygoober211 | Roblox: zohohohobro
 
---[[
-	PuckService
-	Server authoritative puck for my air hockey game.
-
-	Roblox's rigid body solver isn't much use to me here. A real puck rides on an
-	air cushion, never leaves one flat plane, and has to bounce cleanly off rails
-	that are a fraction of a stud thick. Handing that to the engine got me pucks
-	tipping up onto their edge, pucks crawling to a stop nothing like a real
-	table, and once they got quick, pucks passing straight through the boards
-	between two frames.
-
-	So the puck is anchored and I move it myself every tick:
-
-		integrate velocity -> substep the motion -> push out of any wall -> goal check
-
-	One of these per table. TableManager constructs them and drives tick() off
-	Heartbeat, PaddleService calls applyPaddleHit() when a mallet catches the puck.
-	Nothing here touches a global, so twenty five tables run side by side without
-	knowing about each other.
-]]
+-- PuckService, server side puck for my air hockey game.
+-- Engine physics didn't work here. Puck tips onto its edge, glide is nothing like a real table, and at speed it
+-- passes clean through rails that are only ~0.3 studs thick. So it's anchored and I move it myself.
+-- tick() -> drag -> substep the move -> push out of walls -> goal check
+-- One per table. TableManager owns the Heartbeat loop, PaddleService calls applyPaddleHit when a mallet connects.
 
 local TUNING = {
-	-- studs/sec. the table is ~13.75 studs goal to goal, so this ceiling crosses
-	-- it in a bit over half a second. any quicker and you genuinely can't react.
-	MAX_SPEED = 26,
-
-	-- the air cushion. fraction of speed kept per second, raised to dt so the
-	-- glide is the same whether the server is at 60 or at 20. it was a flat
-	-- per-frame multiply originally and the puck slid noticeably further on a
-	-- busy server, which took me embarrassingly long to spot.
-	DRAG_PER_SECOND = 0.88,
-
-	PADDLE_RESTITUTION = 0.8,  -- plastic on plastic
-	TANGENT_KEEP = 0.85,       -- sideways slide that survives a paddle hit
-	WALL_RESTITUTION = 0.92,   -- boards take a little more out of it
-
-	-- not a launch speed. this only exists so a puck can't end up parked inside
-	-- the paddle face with nowhere to go.
-	MIN_HIT_SPEED = 3,
-
-	-- paddle velocity is derived from cursor positions the client sends, so one
-	-- hitched frame can report something ridiculous. cap what a single hit is
-	-- allowed to transfer or that frame becomes an unreturnable shot.
-	MAX_PADDLE_SPEED = 14,
-
-	-- quieter bounces are silent, and one wall sound per cooldown at most.
-	-- without both of these a puck grinding along a rail machine guns the audio.
+	MAX_SPEED = 26,            -- studs/s. table's ~13.75 studs end to end so this crosses it in a bit over half a sec
+	DRAG_PER_SECOND = 0.88,    -- air cushion, applied as ^dt. was a flat per frame multiply and the puck slid further on a laggy server
+	PADDLE_RESTITUTION = 0.8,
+	TANGENT_KEEP = 0.85,       -- sideways slide kept through a paddle hit
+	WALL_RESTITUTION = 0.92,
+	MIN_HIT_SPEED = 3,         -- not a launch speed, just stops the puck parking inside the paddle face
+	MAX_PADDLE_SPEED = 14,     -- paddle vel is derived from client cursor pos, one hitched frame reports something stupid
 	WALL_HIT_MIN_SPEED = 4,
-	WALL_HIT_COOLDOWN = 0.08,
-
-	-- gap left between puck and wall after a push out, so the same contact
-	-- doesn't immediately resolve again next frame
-	CONTACT_SKIN = 0.001,
-
+	WALL_HIT_COOLDOWN = 0.08,  -- otherwise a puck grinding down a rail machine guns the sound
+	CONTACT_SKIN = 0.001,      -- gap left after a push out so the same contact doesn't fire again next frame
 	MAX_SUBSTEPS = 8,
 }
 
@@ -63,9 +26,7 @@ local function flat(v: Vector3): Vector3
 	return Vector3.new(v.X, 0, v.Z)
 end
 
--- Half height of a part's world space bounding box, correct at any rotation.
--- Needed because a few rails on the table are angled and their Size.Y alone
--- says nothing useful about how tall they are in world space.
+-- half height of the world space bbox. a few of the rails are angled so Size.Y on its own tells me nothing
 local function worldHalfHeight(part: BasePart): number
 	local cf, size = part.CFrame, part.Size
 	return math.abs(cf.RightVector.Y) * size.X * 0.5
@@ -79,15 +40,8 @@ local function pointInsidePart(point: Vector3, part: BasePart): boolean
 	return math.abs(p.X) <= h.X and math.abs(p.Y) <= h.Y and math.abs(p.Z) <= h.Z
 end
 
---[[
-	Closest point test between the puck's circle and one wall's footprint, done
-	in the wall's own object space so angled rails need no special casing. The
-	whole thing collapses to "clamp the puck centre into the box, look at what's
-	left over".
-
-	Returns a world space direction to push along and how deep the overlap is,
-	or nil when the puck is clear of this wall.
-]]
+-- closest point test, circle vs the wall's footprint, run in the wall's object space so angled rails need no special case
+-- gives back a world space push direction + how deep the overlap is, or nil when it's clear
 local function circleVsWall(pos: Vector3, wall: BasePart, radius: number): (Vector3?, number)
 	local localPos = wall.CFrame:PointToObjectSpace(pos)
 	local half = wall.Size * 0.5
@@ -106,14 +60,12 @@ local function circleVsWall(pos: Vector3, wall: BasePart, radius: number): (Vect
 	local depth: number
 
 	if distSq > 1e-8 then
-		-- centre is outside the box. push straight out from the nearest point,
-		-- which gets the goal post corners right as well as the flat faces.
+		-- outside the box, push out from the nearest point. gets the goal post corners right as well as flat faces
 		local dist = math.sqrt(distSq)
 		localNormal = Vector3.new(offsetX / dist, 0, offsetZ / dist)
 		depth = radius - dist
 	else
-		-- centre is already inside the box. that means it tunnelled or got spawned
-		-- there, and the nearest point is useless, so leave by the nearest face.
+		-- centre's already inside, so it tunnelled or got spawned in there. nearest point is useless, leave by nearest face
 		local penX = half.X - math.abs(localPos.X)
 		local penZ = half.Z - math.abs(localPos.Z)
 		if penX < penZ then
@@ -159,13 +111,13 @@ function PuckService.new(tableModel: Model): PuckService
 	local borders = tableModel:WaitForChild("Table"):WaitForChild("Borders")
 	local puckModel = tableModel:WaitForChild("GamePeices"):WaitForChild("Puck")
 	local puckRoot = puckModel:FindFirstChildWhichIsA("BasePart", true)
-	assert(puckRoot, "Puck model needs at least one BasePart in " .. tableModel.Name)
+	assert(puckRoot, "Puck model needs a BasePart in " .. tableModel.Name)
 
 	local rayParams = RaycastParams.new()
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
 	rayParams.FilterDescendantsInstances = { puckModel }
 
-	local self = setmetatable({
+	return setmetatable({
 		tableModel = tableModel,
 		borders = borders,
 		puckModel = puckModel,
@@ -187,31 +139,25 @@ function PuckService.new(tableModel: Model): PuckService
 		baseRotation = puckRoot.CFrame.Rotation,
 		lastWallHitAt = 0,
 	}, PuckService)
-
-	return self
 end
 
--- Everything downstream depends on knowing the plane the puck sits on, so
--- planeY has to be resolved before the walls or the bounds are worked out.
 function PuckService:init()
 	self:_weldParts()
+	-- order matters, walls and bounds both need planeY
 	self.planeY = self.puckRoot.Position.Y
 	self.radius = self:_measureRadius()
 	self:_collectWalls()
 	self:_computeBounds()
 
-	-- published so PaddleService and the client's mouse ray aim at the same
-	-- height. tables are scattered around the map at different elevations.
+	-- PaddleService and the client's mouse ray read this. tables sit at different heights around the map
 	self.tableModel:SetAttribute("PlayPlaneY", self.planeY)
 
 	self.puckRoot.AssemblyLinearVelocity = Vector3.zero
 	self.puckRoot.AssemblyAngularVelocity = Vector3.zero
 end
 
--- One anchored part carries the puck and every other part is welded to it and
--- made non-collidable. Moving a single anchored root is far cheaper than asking
--- the solver to keep a model rigid, and it means CanQuery stays true on exactly
--- one part for the paddle's raycasts to find.
+-- one anchored part carries everything else. way cheaper than making the solver hold a model rigid,
+-- and it leaves CanQuery true on exactly one part for the paddle's raycasts to find
 function PuckService:_weldParts()
 	local root = self.puckRoot
 	root.Anchored = true
@@ -234,18 +180,15 @@ function PuckService:_weldParts()
 	end
 end
 
--- Measured off the whole model rather than off puckRoot. puckRoot is a thin
--- cylinder whose Size.X is its *thickness*, so reading it directly gave me a
--- radius about a fifth of the real one and the puck happily clipped the rails.
--- The model extents give the visible disc exactly.
+-- measure the model, NOT puckRoot. root is a thin cylinder and its Size.X is the thickness, using that
+-- gave me a radius about a fifth of the real one and the puck clipped straight through the rails
 function PuckService:_measureRadius(): number
 	local extents = self.puckModel:GetExtentsSize()
 	return math.max(extents.X, extents.Z) * 0.5
 end
 
--- Only the border parts that actually sit at the puck's height count as walls.
--- The rink has trim and support pieces above and below the play plane, two of
--- them across the goal mouths, and treating those as solid walled off both goals.
+-- only borders actually at the puck's height. there's trim sitting above and below the play plane and two bits
+-- of it cross the goal mouths, counting those as solid walled both goals off
 function PuckService:_collectWalls()
 	table.clear(self.walls)
 	for _, inst in ipairs(self.borders:GetDescendants()) do
@@ -259,10 +202,7 @@ function PuckService:_collectWalls()
 	end
 end
 
--- These are the outer extents of the border frame, so this is only a far field
--- backstop for a puck that has somehow escaped the rink entirely. _resolveWalls
--- does the real containment. Both axes get padded by the radius; Z was left
--- unpadded at first and the puck sank a full radius into the side rails.
+-- outer extents of the border frame, only a backstop for a puck that's escaped entirely, _resolveWalls does the real work
 function PuckService:_computeBounds()
 	local b = self.bounds
 	for _, inst in ipairs(self.borders:GetDescendants()) do
@@ -276,6 +216,7 @@ function PuckService:_computeBounds()
 		end
 	end
 
+	-- pad both. I only had X in here at first and the puck sank a full radius into the side rails
 	b.minX += self.radius
 	b.maxX -= self.radius
 	b.minZ += self.radius
@@ -284,25 +225,16 @@ function PuckService:_computeBounds()
 	b.centerZ = (b.minZ + b.maxZ) * 0.5
 end
 
--- Keeps the puck's original pitch and roll but lets the yaw it has picked up
--- carry through, and pins Y to the play plane. Building the CFrame from
--- orientation rather than assigning Position stops any drift off the plane.
+-- keeps the puck's original pitch/roll, lets yaw carry, pins Y. built from orientation so it can't drift off the plane
 function PuckService:_setPosition(pos: Vector3)
 	local _, yaw, _ = self.puckRoot.CFrame:ToOrientation()
 	local pitch, _, roll = self.baseRotation:ToOrientation()
-	self.puckRoot.CFrame = CFrame.new(pos.X, self.planeY, pos.Z)
-		* CFrame.Angles(pitch, yaw, roll)
+	self.puckRoot.CFrame = CFrame.new(pos.X, self.planeY, pos.Z) * CFrame.Angles(pitch, yaw, roll)
 end
 
---[[
-	Pushes the puck out of anything it overlaps and reflects its velocity off
-	whatever it hit. Deepest overlap first, then run again, up to four passes:
-	a puck jammed into a corner needs resolving against both walls, and doing
-	them in one pass just shoves it into the other one.
-
-	Returns the corrected position and the speed of the hardest impact, which
-	tick() grades the bounce sound on.
-]]
+-- push out of whatever it's overlapping and reflect off it. deepest first, then go again up to 4 times,
+-- because a puck jammed in a corner needs both walls and doing one just shoves it into the other
+-- returns the fixed up position + the hardest impact speed, tick() picks the bounce sound off that
 function PuckService:_resolveWalls(pos: Vector3): (Vector3, number)
 	local impactSpeed = 0
 
@@ -321,26 +253,20 @@ function PuckService:_resolveWalls(pos: Vector3): (Vector3, number)
 			break
 		end
 
-		pos = Vector3.new(pos.X, self.planeY, pos.Z)
-			+ bestNormal * (bestDepth + TUNING.CONTACT_SKIN)
+		pos = Vector3.new(pos.X, self.planeY, pos.Z) + bestNormal * (bestDepth + TUNING.CONTACT_SKIN)
 
-		-- only reflect if it's actually moving into the wall. a puck sliding
-		-- along a rail is in contact every frame and shouldn't be braked for it.
+		-- only bounce if it's moving INTO the wall. a puck sliding along a rail touches every frame and shouldn't get braked for it
 		local closing = self.velocity:Dot(bestNormal)
 		if closing < 0 then
 			impactSpeed = math.max(impactSpeed, self.velocity.Magnitude)
-			local reflected = self.velocity
-				- (1 + TUNING.WALL_RESTITUTION) * closing * bestNormal
-			self.velocity = flat(reflected)
+			self.velocity = flat(self.velocity - (1 + TUNING.WALL_RESTITUTION) * closing * bestNormal)
 		end
 	end
 
 	return pos, impactSpeed
 end
 
--- Did the puck cross this goal at any point during the frame? A raycast alone
--- misses the case where the puck starts the frame already inside the goal box,
--- so the swept segment gets sampled as well.
+-- raycast misses the case where the puck starts the frame already sat in the goal box, so sample the segment too
 function PuckService:_crossedGoal(startPos: Vector3, endPos: Vector3, goal: BasePart): boolean
 	local dir = endPos - startPos
 	if dir.Magnitude <= 0 then
@@ -361,11 +287,10 @@ function PuckService:_crossedGoal(startPos: Vector3, endPos: Vector3, goal: Base
 	return false
 end
 
--- Hard clamp to the rink, except inside a goal mouth where the puck is supposed
--- to be past the Z limit.
 function PuckService:_clamp(pos: Vector3): Vector3
 	local b = self.bounds
 	local z = pos.Z
+	-- don't clamp Z inside a goal mouth, it's meant to be past the limit there
 	if not pointInsidePart(pos, self.blueGoal) and not pointInsidePart(pos, self.orangeGoal) then
 		z = math.clamp(z, b.minZ, b.maxZ)
 	end
@@ -376,21 +301,12 @@ function PuckService:setGoalHandler(fn: (string) -> ())
 	self.goalHandler = fn
 end
 
--- Called with the impact speed every time the puck bounces off a border.
+-- gets the impact speed each time it bounces off a border
 function PuckService:setWallHitHandler(fn: (number) -> ())
 	self.wallHitHandler = fn
 end
 
---[[
-	One physics step. Driven from TableManager's Heartbeat loop.
-
-	The substepping is the important part. The rails are around 0.3 studs thick
-	and the puck can be doing 26 studs/sec, which is over 0.4 studs of travel in
-	a single 60hz frame, so a naive "move then test" lets it teleport clean
-	through a board. Splitting the frame so no step advances more than half a
-	radius makes that impossible, and re-reading velocity each step means the
-	rest of the frame follows the rebound instead of ploughing onward.
-]]
+-- one physics step, driven off TableManager's Heartbeat
 function PuckService:tick(state: string, dt: number?)
 	if self.scored then
 		return
@@ -415,6 +331,9 @@ function PuckService:tick(state: string, dt: number?)
 	local startPos = self.puckRoot.Position
 	local travel = self.velocity.Magnitude * dt
 
+	-- this is the bit that stops tunnelling. no step moves more than half a radius. rails are ~0.3 studs and 26 studs/s
+	-- is 0.43 per 60hz frame, so move-then-test lets it jump the board. velocity is re-read each step so the rest of
+	-- the frame follows the bounce instead of carrying on into the wall
 	local steps = 1
 	if self.radius > 0 then
 		steps = math.clamp(math.ceil(travel / (self.radius * 0.5)), 1, TUNING.MAX_SUBSTEPS)
@@ -440,8 +359,7 @@ function PuckService:tick(state: string, dt: number?)
 
 	newPos = self:_clamp(newPos)
 
-	-- goals are checked against the swept segment, not the end point, for the
-	-- same reason the motion is substepped
+	-- swept, same reason as the substepping above
 	if self:_crossedGoal(startPos, newPos, self.blueGoal) then
 		return self:score("Orange")
 	elseif self:_crossedGoal(startPos, newPos, self.orangeGoal) then
@@ -469,8 +387,7 @@ function PuckService:_setVisible(visible: boolean)
 	end
 end
 
--- Guarded by self.scored so a puck that clips both goal posts on the way in
--- can't fire the handler twice and award two points.
+-- self.scored guard, a puck clipping both posts on the way in used to fire this twice and score 2
 function PuckService:score(team: string)
 	if self.scored then
 		return
@@ -485,19 +402,9 @@ function PuckService:score(team: string)
 	end
 end
 
---[[
-	Resolves a paddle contact as a bounce off an infinitely heavy moving wall,
-	which is near enough how a mallet behaves against a puck: the puck rebounds
-	along the contact normal having lost a bit of energy, then picks up the
-	paddle's own motion on top. The nice property is that a stationary paddle
-	behaves as a wall rather than a launcher, which is what you want.
-
-	`normal` points from the paddle centre to the puck centre and comes from
-	PaddleService's swept contact test, so it's the normal at first touch rather
-	than at wherever the paddle ended up.
-
-	Returns the puck's new speed; the caller picks a hit sound off it.
-]]
+-- treated as a bounce off an infinitely heavy moving wall, which is basically what a mallet is to a puck.
+-- reflect along the normal, lose a bit, add the paddle's own velocity on top. a still paddle acts like a wall, not a launcher.
+-- normal runs paddle centre -> puck centre and PaddleService hands it over at first contact, not wherever the sweep ended
 function PuckService:applyPaddleHit(normal: Vector3, paddleVel: Vector3): number
 	if self.scored then
 		return 0
@@ -514,17 +421,15 @@ function PuckService:applyPaddleHit(normal: Vector3, paddleVel: Vector3): number
 		pv = pv.Unit * TUNING.MAX_PADDLE_SPEED
 	end
 
-	-- shift into the paddle's frame, bounce, shift back
+	-- into the paddle's frame, bounce, back out
 	local rel = self.velocity - pv
 	local vn = rel:Dot(n)
 	local vt = rel - n * vn
 
 	if vn < 0 then
-		-- closing, so flip the normal component and bleed the slide
 		rel = vt * TUNING.TANGENT_KEEP - n * (vn * TUNING.PADDLE_RESTITUTION)
 	else
-		-- already separating. leave the normal component alone, otherwise a
-		-- glancing touch on a puck that's leaving kills its momentum.
+		-- already separating, leave the normal bit alone or a graze on a puck that's leaving kills it
 		rel = vt * TUNING.TANGENT_KEEP + n * vn
 	end
 
@@ -540,17 +445,9 @@ function PuckService:applyPaddleHit(normal: Vector3, paddleVel: Vector3): number
 	return newVel.Magnitude
 end
 
---[[
-	Pushes the puck clear of a point it's overlapping, in practice wherever the
-	paddle ended up this frame.
-
-	The paddle follows the cursor exactly and is allowed to travel straight past
-	the puck, so without this the puck is left visually buried inside the mallet
-	and gets re-contacted next frame. It leaves along the heading it just picked
-	up where there is one, so a hard flick carries it forward rather than
-	squeezing it out sideways, and the result goes back through the wall solver
-	so popping it out can never bury it in a rail instead.
-]]
+-- shove the puck clear of wherever the paddle ended up. the paddle tracks the cursor exactly and is allowed to run
+-- straight past the puck, so without this it ends up buried in the mallet and gets contacted again next frame.
+-- leaves along the heading it just picked up so a hard flick carries it forward instead of squeezing out sideways
 function PuckService:separateFrom(point: Vector3, minDistance: number)
 	if self.scored then
 		return
@@ -568,11 +465,11 @@ function PuckService:separateFrom(point: Vector3, minDistance: number)
 	elseif away.Magnitude > 1e-4 then
 		direction = away.Unit
 	else
-		return  -- dead centre and not moving, nothing sensible to pick
+		return -- dead centre and stopped, nothing sensible to pick
 	end
 
-	local target = Vector3.new(point.X, self.planeY, point.Z)
-		+ direction * (minDistance + TUNING.CONTACT_SKIN)
+	local target = Vector3.new(point.X, self.planeY, point.Z) + direction * (minDistance + TUNING.CONTACT_SKIN)
+	-- back through the wall solver, otherwise popping it off the paddle can bury it in a rail
 	self:_setPosition(self:_clamp((self:_resolveWalls(target))))
 end
 
@@ -580,8 +477,7 @@ function PuckService:getVelocity(): Vector3
 	return self.velocity
 end
 
--- The collision radius, so PaddleService sweeps against the same disc the wall
--- solver uses instead of against puckRoot's raw box.
+-- so PaddleService sweeps against the same disc the wall solver uses, not puckRoot's box
 function PuckService:getRadius(): number
 	return self.radius
 end
